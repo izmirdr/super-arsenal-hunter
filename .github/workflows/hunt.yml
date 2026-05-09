@@ -1,0 +1,271 @@
+name: SUPER-ARSENAL HUNT
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'   # cdo 3 ore
+  workflow_dispatch:         # manual trigger
+    inputs:
+      domain:
+        description: 'Target domain (optional)'
+        required: false
+      program:
+        description: 'Program name (optional)'
+        required: false
+
+env:
+  GO111MODULE: on
+  PATH: /root/go/bin:/usr/local/go/bin:$PATH
+
+jobs:
+  recon:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: go-mod-${{ runner.os }}-${{ hashFiles('setup.sh') }}
+        restore-keys: go-mod-${{ runner.os }}-
+
+    - name: Cache Tools
+      id: cache-tools
+      uses: actions/cache@v4
+      with:
+        path: ~/go/bin
+        key: tools-${{ runner.os }}-v1-${{ hashFiles('setup.sh') }}
+
+    - name: Setup Arsenal
+      if: steps.cache-tools.outputs.cache-hit != 'true'
+      run: |
+        export PATH=$PATH:/usr/local/go/bin:~/go/bin
+        sudo apt-get update -qq && sudo apt-get install -y -qq jq curl python3 python3-pip unzip 2>/dev/null
+
+        # Install Go (ARM64/AMD64 auto-detect)
+        if [ ! -f /usr/local/go/bin/go ]; then
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then GOARCH="amd64"; else GOARCH="arm64"; fi
+          curl -sL "https://go.dev/dl/go1.22.4.linux-${GOARCH}.tar.gz" | sudo tar -C /usr/local -xz
+          sudo ln -sf /usr/local/go/bin/go /usr/local/bin/go
+        fi
+
+        # Core recon tools
+        go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 2>/dev/null
+        go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest 2>/dev/null
+        go install -v github.com/tomnomnom/waybackurls@latest 2>/dev/null
+        go install -v github.com/lc/gau/v2/cmd/gau@latest 2>/dev/null
+        go install -v github.com/tomnomnom/gf@latest 2>/dev/null
+        go install -v github.com/tomnomnom/anew@latest 2>/dev/null
+        go install -v github.com/tomnomnom/assetfinder@latest 2>/dev/null
+        go install -v github.com/BishopFox/jsluice/cmd/jsluice@latest 2>/dev/null
+        go install -v github.com/assetnote/surf/cmd/surf@latest 2>/dev/null
+        go install -v github.com/projectdiscovery/katana/cmd/katana@latest 2>/dev/null
+
+        # Nuclei + templates
+        go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null
+        nuclei -update-templates -silent 2>/dev/null &
+
+        mkdir -p ~/arsenal/wordlists ~/reports
+        echo "Tools installed: $(ls ~/go/bin/ | wc -l)"
+
+    - name: Setup Config
+      run: |
+        # Subfinder config (free sources, no API keys)
+        mkdir -p ~/.config/subfinder
+        echo "sources: [certspotter, crtsh, hackertarget, bufferover, alienvault, anubis, chaos, dnsdumpster, riddler, threatminer, waybackarchive]" > ~/.config/subfinder/config.yaml
+
+        # GF patterns
+        mkdir -p ~/.gf
+        for pat in xss sqli ssrf lfi rce idor redirect; do
+          echo ".*" > ~/.gf/$pat.json
+        done
+
+    - name: Select Target
+      id: target
+      run: |
+        # Auto-cycle through programs from DB snapshot or use manual input
+        if [ -n "${{ inputs.domain }}" ]; then
+          echo "domain=${{ inputs.domain }}" >> $GITHUB_OUTPUT
+          echo "program=${{ inputs.program || 'Manual' }}" >> $GITHUB_OUTPUT
+        else
+          # Read from programs list (subset of best-paying programs)
+          PROGRAMS=("shopify.com" "yelp.com" "twilio.com" "paypal.com" "tesla.com" "atlassian.com" "reddit.com" "oppo.com" "gitlab.com" "nextcloud.com" "ovhcloud.com" "linkedin.com")
+          IDX=$(( RANDOM % ${#PROGRAMS[@]} ))
+          echo "domain=${PROGRAMS[$IDX]}" >> $GITHUB_OUTPUT
+          echo "program=${PROGRAMS[$IDX]%%.*}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Recon Phase
+      id: recon
+      run: |
+        export PATH=$PATH:~/go/bin:/usr/local/go/bin
+        DOMAIN="${{ steps.target.outputs.domain }}"
+        PROGRAM="${{ steps.target.outputs.program }}"
+        TMP="/tmp/recon-$DOMAIN"
+        echo "🎯 $PROGRAM — $DOMAIN"
+
+        # 1. Subdomains (passive)
+        timeout 120 subfinder -d "$DOMAIN" -silent -all 2>/dev/null > "$TMP-subs.txt"
+        curl -s --max-time 20 "https://crt.sh/?q=%.$DOMAIN&output=json" 2>/dev/null | jq -r '.[].name_value' 2>/dev/null | tr ',' '\n' >> "$TMP-subs.txt"
+        assetfinder --subs-only "$DOMAIN" 2>/dev/null >> "$TMP-subs.txt"
+        sort -u "$TMP-subs.txt" -o "$TMP-subs.txt"
+        SUBS=$(wc -l < "$TMP-subs.txt" 2>/dev/null || echo 0)
+        [ "$SUBS" -gt 3000 ] && { head -3000 "$TMP-subs.txt" > "$TMP-subs-top.txt"; mv "$TMP-subs-top.txt" "$TMP-subs.txt"; SUBS=3000; }
+        echo "subs=$SUBS" >> $GITHUB_OUTPUT
+        echo "  ✅ $SUBS subdomains"
+
+        # 2. Live hosts (top 100 subs)
+        head -100 "$TMP-subs.txt" | httpx -silent -timeout 5 -status-code -title -o "$TMP-live.txt" 2>/dev/null
+        LIVE=$(wc -l < "$TMP-live.txt" 2>/dev/null || echo 0)
+        echo "live=$LIVE" >> $GITHUB_OUTPUT
+        echo "  📡 $LIVE live hosts"
+
+        # 3. URLs (gau + waybackurls + katana)
+        timeout 60 gau --subs "$DOMAIN" 2>/dev/null | head -500 > "$TMP-urls.txt"
+        timeout 60 waybackurls "$DOMAIN" 2>/dev/null | head -500 >> "$TMP-urls.txt"
+        [ "$LIVE" -gt 0 ] && [ "$LIVE" -lt 30 ] && timeout 60 katana -list "$TMP-live.txt" -silent 2>/dev/null | head -200 >> "$TMP-urls.txt"
+        sort -u "$TMP-urls.txt" -o "$TMP-urls.txt" 2>/dev/null
+        URLS=$(wc -l < "$TMP-urls.txt" 2>/dev/null || echo 0)
+        echo "urls=$URLS" >> $GITHUB_OUTPUT
+        echo "  🔗 $URLS URLs"
+
+        # 4. Interesting subdomains (Shtylla 1 — hidden targets)
+        grep -iE '(dev|staging|stage|admin|internal|api|test|sandbox|debug|beta|alpha|uat|qa|demo|preprod|legacy|old|backup|mgmt|console|portal|dashboard|grafana|jenkins|sentry|vault|argo|gitlab|registry|kubernetes|swagger|graphql|monitor|metrics|mail|auth|sso|login|billing|payment)' "$TMP-subs.txt" 2>/dev/null > "$TMP-interesting.txt"
+        INTERESTING=$(wc -l < "$TMP-interesting.txt" 2>/dev/null || echo 0)
+        echo "interesting=$INTERESTING" >> $GITHUB_OUTPUT
+        echo "  🎯 $INTERESTING interesting subdomains (dev/staging/admin/etc)"
+
+    - name: Vulnerability Detection
+      id: vuln
+      run: |
+        export PATH=$PATH:~/go/bin:/usr/local/go/bin
+        DOMAIN="${{ steps.target.outputs.domain }}"
+        PROGRAM="${{ steps.target.outputs.program }}"
+        TMP="/tmp/recon-$DOMAIN"
+        mkdir -p /tmp/findings
+
+        # 1. IDOR candidates (parameterized URLs with numeric IDs)
+        echo "=== IDOR Candidates ===" > /tmp/findings/idor.txt
+        grep -E '(^|\?|&)(id|user_id|uid|account_id|order_id|profile_id|doc_id|file_id|report_id|ticket_id|number|num)\s*[=:/]\s*[0-9]{1,10}(\b|[&/])' "$TMP-urls.txt" 2>/dev/null | head -30 >> /tmp/findings/idor.txt
+        IDOR=$(grep -c "http" /tmp/findings/idor.txt 2>/dev/null || echo 0)
+        echo "idor=$IDOR" >> $GITHUB_OUTPUT
+        echo "  🎯 $IDOR IDOR candidates"
+
+        # 2. API endpoints
+        echo "=== API Endpoints ===" > /tmp/findings/api.txt
+        grep -E '/api/|/graphql|/v[0-9]+/|/rest/|swagger|openapi' "$TMP-urls.txt" 2>/dev/null | head -30 >> /tmp/findings/api.txt
+        API=$(grep -c "http" /tmp/findings/api.txt 2>/dev/null || echo 0)
+        echo "api=$API" >> $GITHUB_OUTPUT
+        echo "  📡 $API API endpoints"
+
+        # 3. JS files → jsluice secrets
+        echo "=== JS Secrets ===" > /tmp/findings/secrets.txt
+        grep -E '\.js(\?|$)' "$TMP-urls.txt" 2>/dev/null | head -20 | while read url; do
+          curl -s --connect-timeout 5 --max-time 10 "$url" 2>/dev/null
+        done | jsluice secrets 2>/dev/null | head -20 >> /tmp/findings/secrets.txt
+        SECRETS=$(grep -c . /tmp/findings/secrets.txt 2>/dev/null || echo 0)
+        echo "secrets=$SECRETS" >> $GITHUB_OUTPUT
+        echo "  🔑 $(grep -c . /tmp/findings/secrets.txt 2>/dev/null) JS secrets"
+
+        # 4. SSRF candidates (URL parameters)
+        echo "=== SSRF Candidates ===" > /tmp/findings/ssrf.txt
+        grep -E '(url|uri|redirect|callback|webhook|proxy|fetch|download|import|load)=' "$TMP-urls.txt" 2>/dev/null | head -20 > /tmp/findings/ssrf.txt
+        SSRF=$(grep -c "http" /tmp/findings/ssrf.txt 2>/dev/null || echo 0)
+        echo "ssrf=$SSRF" >> $GITHUB_OUTPUT
+        echo "  🔗 $SSRF SSRF candidates"
+
+        # 5. Quick nuclei on live hosts (limited templates)
+        if [ "${{ steps.recon.outputs.live }}" -gt 0 ] && [ "${{ steps.recon.outputs.live }}" -lt 30 ]; then
+          awk '{print $1}' "$TMP-live.txt" | head -20 | nuclei -silent -severity medium,high,critical -timeout 8 -c 2 -retries 1 -t exposures -t misconfiguration 2>/dev/null | head -30 > /tmp/findings/nuclei.txt
+          echo "  ☢️ $(wc -l < /tmp/findings/nuclei.txt 2>/dev/null) nuclei hits"
+        fi
+
+        # 6. Interesting hosts (for surf SSRF scanning)
+        echo "=== Interesting Hosts ===" > /tmp/findings/interesting-hosts.txt
+        cat "$TMP-interesting.txt" 2>/dev/null | head -20 >> /tmp/findings/interesting-hosts.txt
+
+        # 7. Top live hosts with codes
+        echo "=== Live Hosts ===" > /tmp/findings/live-hosts.txt
+        head -20 "$TMP-live.txt" 2>/dev/null >> /tmp/findings/live-hosts.txt
+
+    - name: Generate Report
+      run: |
+        DOMAIN="${{ steps.target.outputs.domain }}"
+        PROGRAM="${{ steps.target.outputs.program }}"
+
+        cat > /tmp/findings/REPORT.md << EOF
+        # 🎯 $PROGRAM — $DOMAIN
+        **Date:** $(date -u)
+        **Runner:** GitHub Actions (free)
+
+        ## Stats
+        | Metric | Count |
+        |--------|-------|
+        | Subdomains | ${{ steps.recon.outputs.subs }} |
+        | Live Hosts | ${{ steps.recon.outputs.live }} |
+        | URLs | ${{ steps.recon.outputs.urls }} |
+        | Interesting Subs | ${{ steps.recon.outputs.interesting }} |
+        | IDOR Candidates | ${{ steps.vuln.outputs.idor }} |
+        | API Endpoints | ${{ steps.vuln.outputs.api }} |
+        | JS Secrets | ${{ steps.vuln.outputs.secrets }} |
+        | SSRF Candidates | ${{ steps.vuln.outputs.ssrf }} |
+
+        ## Interesting Subdomains (Hidden Targets)
+        \`\`\`
+        $(head -15 /tmp/findings/interesting-hosts.txt 2>/dev/null)
+        \`\`\`
+
+        ## IDOR Candidates
+        \`\`\`
+        $(head -10 /tmp/findings/idor.txt 2>/dev/null)
+        \`\`\`
+
+        ## API Endpoints
+        \`\`\`
+        $(head -10 /tmp/findings/api.txt 2>/dev/null)
+        \`\`\`
+
+        ## JS Secrets
+        \`\`\`
+        $(head -10 /tmp/findings/secrets.txt 2>/dev/null)
+        \`\`\`
+
+        ## Live Hosts (Top)
+        \`\`\`
+        $(head -10 /tmp/findings/live-hosts.txt 2>/dev/null)
+        \`\`\`
+
+        ## Nuclei
+        \`\`\`
+        $(head -15 /tmp/findings/nuclei.txt 2>/dev/null)
+        \`\`\`
+
+        ---
+        🤖 Generated by SUPER-ARSENAL Hunter on GitHub Actions
+        EOF
+
+        echo "✅ Report generated:"
+        cat /tmp/findings/REPORT.md
+
+    - name: Upload Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: hunt-${{ steps.target.outputs.program }}-${{ steps.target.outputs.domain }}-${{ github.run_id }}
+        path: /tmp/findings/
+        retention-days: 14
+
+    - name: Save to Repo
+      run: |
+        mkdir -p reports
+        cp /tmp/findings/REPORT.md "reports/${{ steps.target.outputs.program }}-${{ steps.target.outputs.domain }}-$(date +%Y%m%d_%H%M).md"
+        git config user.name "SUPER-ARSENAL Hunter"
+        git config user.email "hunter@super-arsenal.bot"
+        git add reports/
+        git diff --staged --quiet || git commit -m "hunt: ${{ steps.target.outputs.program }} — ${{ steps.target.outputs.domain }} (${{ steps.recon.outputs.subs }} subs)"
+        git push
