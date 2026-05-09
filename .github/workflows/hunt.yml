@@ -69,7 +69,7 @@ jobs:
         DOMAIN="${DOMAIN:-}"
         PROGRAM="${PROGRAM:-}"
         [ -z "$DOMAIN" ] && {
-          PROGS=("yelp.com" "twilio.com" "paypal.com" "tesla.com" "atlassian.com" "oppo.com" "gitlab.com" "nextcloud.com" "ovhcloud.com" "shopify.com" "linkedin.com" "reddit.com")
+          PROGS=("aol.com" "atlassian.com" "cisco.com" "cloudflare.com" "coinbase.com" "coveo.com" "docker.com" "dropbox.com" "expressvpn.com" "fastly.com" "github.com" "gitlab.com" "indeed.com" "linkedin.com" "mastercard.com" "mozilla.org" "netflix.com" "okta.com" "orange.fr" "ovhcloud.com" "paypal.com" "proximus.be" "reddit.com" "salesforce.com" "shopify.com" "slack.com" "snapchat.com" "spotify.com" "tesla.com" "tiktok.com" "twilio.com" "twitter.com" "uber.com" "verizonmedia.com" "wordpress.com" "wordpress.org" "x.com" "yahoo.com" "yelp.com")
           IDX=$(( RANDOM % ${#PROGS[@]} ))
           DOMAIN="${PROGS[$IDX]}"
           PROGRAM="${DOMAIN%%.*}"
