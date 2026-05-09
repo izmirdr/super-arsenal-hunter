@@ -70,9 +70,20 @@ jobs:
         DOMAIN="${DOMAIN:-}"
         PROGRAM="${PROGRAM:-}"
         [ -z "$DOMAIN" ] && {
-          PROGS=("aol.com" "atlassian.com" "cisco.com" "cloudflare.com" "coinbase.com" "coveo.com" "docker.com" "dropbox.com" "expressvpn.com" "fastly.com" "github.com" "gitlab.com" "indeed.com" "linkedin.com" "mastercard.com" "mozilla.org" "netflix.com" "okta.com" "orange.fr" "ovhcloud.com" "paypal.com" "proximus.be" "reddit.com" "salesforce.com" "shopify.com" "slack.com" "snapchat.com" "spotify.com" "tesla.com" "tiktok.com" "twilio.com" "twitter.com" "uber.com" "verizonmedia.com" "wordpress.com" "wordpress.org" "x.com" "yahoo.com" "yelp.com")
-          IDX=$(( RANDOM % ${#PROGS[@]} ))
-          DOMAIN="${PROGS[$IDX]}"
+          # Tier 1 (50%): Smaller/less-defended programs - better ROI
+          TIER1=("coveo.com" "expressvpn.com" "proximus.be" "orange.fr" "ovhcloud.com" "mozilla.org" "fastly.com" "indeed.com" "verizonmedia.com" "docker.com" "aol.com" "wordpress.org")
+          # Tier 2 (30%): Mid-size programs
+          TIER2=("shopify.com" "gitlab.com" "twilio.com" "atlassian.com" "slack.com" "dropbox.com" "okta.com" "cisco.com" "spotify.com" "uber.com" "snapchat.com" "wordpress.com")
+          # Tier 3 (20%): Large/well-defended programs
+          TIER3=("coinbase.com" "paypal.com" "reddit.com" "yelp.com" "salesforce.com" "linkedin.com" "tesla.com" "netflix.com" "github.com" "twitter.com" "x.com" "tiktok.com" "mastercard.com" "cloudflare.com" "yahoo.com")
+          R=$(( RANDOM % 100 ))
+          if [ $R -lt 50 ]; then
+            DOMAIN="${TIER1[$(( RANDOM % ${#TIER1[@]} ))]}"
+          elif [ $R -lt 80 ]; then
+            DOMAIN="${TIER2[$(( RANDOM % ${#TIER2[@]} ))]}"
+          else
+            DOMAIN="${TIER3[$(( RANDOM % ${#TIER3[@]} ))]}"
+          fi
           PROGRAM="${DOMAIN%%.*}"
         }
 
@@ -248,11 +259,46 @@ jobs:
         CACHE_CHECKS=$(wc -l < /tmp/findings/deep/cache-check.txt 2>/dev/null || echo 0)
         echo "  Cache checks: $CACHE_CHECKS"
 
+        # --- CDN BYPASS ---
+        > /tmp/findings/deep/origin-hits.txt
+        head -10 "$TMP-live.txt" 2>/dev/null | awk '{print $1}' | sed 's|https://||' | while read host; do
+          [ -z "$host" ] && continue
+          # Check if behind CDN
+          cname=$(dig +short CNAME "$host" 2>/dev/null | head -1)
+          is_cdn=0
+          echo "$cname" | grep -qiE 'cloudflare|fastly|akamai|cloudfront|cdn|azureedge|azurefd|edgekey|edgesuite|akadns|awsdns|googlehosted' && is_cdn=1
+
+          [ "$is_cdn" -eq 1 ] && {
+            # Try origin subdomain patterns
+            base=$(echo "$host" | sed 's/\.[^.]*\.[^.]*$//')
+            for origin_pat in "origin.$host" "direct.$host" "backend.$host" "app.$host" "prod.$host" "origin-$(echo $host | tr '.' '-')" "$(echo $host | sed 's/\.com$/.io/')"; do
+              orig_ip=$(dig +short A "$origin_pat" 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+              [ -n "$orig_ip" ] && {
+                # Probe origin directly
+                orig_resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "Host: $host" "https://$orig_ip/" 2>/dev/null)
+                cdn_resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 "https://$host/" 2>/dev/null)
+                [ "$orig_resp" != "$cdn_resp" ] && [ "$orig_resp" != "000" ] && echo "CDN-BYPASS: $host → origin $origin_pat ($orig_ip) [$orig_resp vs CDN $cdn_resp]" >> /tmp/findings/deep/origin-hits.txt
+              }
+            done
+
+            # Try crt.sh for historical IPs
+            crt_ips=$(curl -s --max-time 10 "https://crt.sh/?q=%.$host&output=json" 2>/dev/null | jq -r '.[].name_value' 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u | head -5)
+            for ip in $crt_ips; do
+              [ "$ip" = "127.0.0.1" ] && continue
+              resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "Host: $host" "https://$ip/" 2>/dev/null)
+              [ "$resp" != "000" ] && [ "$resp" != "403" ] && echo "CRT-ORIGIN: $host → $ip [$resp]" >> /tmp/findings/deep/origin-hits.txt
+            done
+          }
+        done
+        ORIGIN_HITS=$(wc -l < /tmp/findings/deep/origin-hits.txt 2>/dev/null || echo 0)
+        echo "  Origin bypass: $ORIGIN_HITS hits"
+
         # Export deep results for report
         echo "ssrf_deep=$SSRF_DEEP" >> $GITHUB_OUTPUT
         echo "staging_hits=$STAGING_HITS" >> $GITHUB_OUTPUT
         echo "idor_deep=$IDOR_DEEP" >> $GITHUB_OUTPUT
         echo "cache_checks=$CACHE_CHECKS" >> $GITHUB_OUTPUT
+        echo "origin_hits=$ORIGIN_HITS" >> $GITHUB_OUTPUT
 
         echo "DEEP-TEST COMPLETE"
       env:
@@ -286,6 +332,7 @@ jobs:
         | Deep: Staging Hits | ${{ steps.deep-test.outputs.staging_hits }} |
         | Deep: IDOR Suspects | ${{ steps.deep-test.outputs.idor_deep }} |
         | Deep: Cache Checks | ${{ steps.deep-test.outputs.cache_checks }} |
+        | Deep: Origin Bypass | ${{ steps.deep-test.outputs.origin_hits }} |
 
         ## Interesting Subdomains (Shtylla 1: Hidden Targets)
         \`\`\`
@@ -342,6 +389,11 @@ jobs:
         ### Cache Poisoning
         \`\`\`
         $(head -15 /tmp/findings/deep/cache-check.txt 2>/dev/null)
+        \`\`\`
+
+        ### CDN Bypass / Origin Discovery
+        \`\`\`
+        $(head -15 /tmp/findings/deep/origin-hits.txt 2>/dev/null)
         \`\`\`
 
         ---
