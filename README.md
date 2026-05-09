@@ -12,9 +12,12 @@ Every 3 hours, the workflow:
 5. Vulnerability scanning: IDOR, API, JS secrets (jsluice), SSRF, Nuclei
 6. Generates report → saved as artifact + committed to repo
 
-## Programs Tracked
+## Programs Tracked (39)
 
-shopify, yelp, twilio, paypal, tesla, atlassian, reddit, oppo, gitlab, nextcloud, ovhcloud, linkedin
+aol, atlassian, cisco, cloudflare, coinbase, coveo, docker, dropbox, expressvpn, fastly,
+github, gitlab, indeed, linkedin, mastercard, mozilla, netflix, okta, orange, ovhcloud,
+paypal, proximus, reddit, salesforce, shopify, slack, snapchat, spotify, tesla, tiktok,
+twilio, twitter, uber, verizonmedia, wordpress, wordpress.org, x.com, yahoo, yelp
 
 ## Manual Trigger
 
