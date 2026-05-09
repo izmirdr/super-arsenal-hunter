@@ -12,6 +12,9 @@ on:
         description: 'Program name'
         required: false
 
+permissions:
+  contents: write
+
 jobs:
   recon:
     runs-on: ubuntu-22.04
