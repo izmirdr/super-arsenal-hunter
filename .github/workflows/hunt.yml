@@ -110,7 +110,7 @@ jobs:
         echo "  live: $LIVE"
 
         # 3. URLs
-        timeout 60 gau --subs "$DOMAIN" 2>/dev/null | head -500 > "$TMP-urls.txt"
+        timeout 60 gau --subs --providers urlscan,otx "$DOMAIN" 2>/dev/null | head -500 > "$TMP-urls.txt"
         timeout 60 waybackurls "$DOMAIN" 2>/dev/null | head -500 >> "$TMP-urls.txt"
         [ "$LIVE" -gt 0 ] && [ "$LIVE" -lt 30 ] && timeout 60 katana -list "$TMP-live.txt" -silent 2>/dev/null | head -200 >> "$TMP-urls.txt"
         sort -u "$TMP-urls.txt" -o "$TMP-urls.txt" 2>/dev/null
