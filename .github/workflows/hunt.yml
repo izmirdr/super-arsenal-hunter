@@ -62,6 +62,7 @@ jobs:
         echo "tools: $(ls ~/go/bin/ | wc -l)"
 
     - name: Recon
+      id: recon
       run: |
         set +e
         export PATH=$HOME/go/bin:$PATH
@@ -109,6 +110,8 @@ jobs:
         # 4. Interesting subs filter
         grep -iE '(dev|staging|stage|admin|internal|api|test|sandbox|debug|beta|alpha|uat|qa|demo|preprod|legacy|old|backup|mgmt|console|portal|dashboard|grafana|jenkins|sentry|vault|argo|gitlab|registry|kubernetes|swagger|graphql|monitor|metrics|mail|auth|sso|login|billing|payment)' "$TMP-subs.txt" 2>/dev/null | head -50 > "$TMP-interesting.txt"
         echo "interesting=$(wc -l < "$TMP-interesting.txt" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+        echo "program=$PROGRAM" >> $GITHUB_OUTPUT
       env:
         DOMAIN: ${{ inputs.domain }}
         PROGRAM: ${{ inputs.program }}
@@ -118,7 +121,7 @@ jobs:
       run: |
         set +e
         export PATH=$HOME/go/bin:$PATH
-        DOMAIN="${DOMAIN:-${{ inputs.domain }}}"
+        DOMAIN="${DOMAIN:-${{ steps.recon.outputs.domain }}}"
         [ -z "$DOMAIN" ] && DOMAIN="unknown"
         TMP="/tmp/recon-$DOMAIN"
         mkdir -p /tmp/findings
@@ -162,7 +165,7 @@ jobs:
       run: |
         set +e
         export PATH=$HOME/go/bin:$PATH
-        DOMAIN="${DOMAIN:-${{ inputs.domain }}}"
+        DOMAIN="${DOMAIN:-${{ steps.recon.outputs.domain }}}"
         [ -z "$DOMAIN" ] && DOMAIN="unknown"
         TMP="/tmp/recon-$DOMAIN"
         mkdir -p /tmp/findings/deep
@@ -258,8 +261,8 @@ jobs:
     - name: Report
       run: |
         set +e
-        DOMAIN="${DOMAIN:-${{ inputs.domain }}}"
-        PROGRAM="${PROGRAM:-${{ inputs.program }}}"
+        DOMAIN="${DOMAIN:-${{ steps.recon.outputs.domain }}}"
+        PROGRAM="${PROGRAM:-${{ steps.recon.outputs.program }}}"
         [ -z "$DOMAIN" ] && DOMAIN="unknown"
         [ -z "$PROGRAM" ] && PROGRAM="auto"
 
