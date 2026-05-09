@@ -158,7 +158,7 @@ jobs:
 
         # Nuclei
         if [ -s "$TMP-live.txt" ] && [ "$(wc -l < "$TMP-live.txt")" -lt 30 ]; then
-          awk '{print $1}' "$TMP-live.txt" | head -20 | nuclei -silent -severity medium,high,critical -timeout 8 -c 2 -t ~/nuclei-templates/http/exposures -t ~/nuclei-templates/http/misconfiguration 2>/dev/null | head -30 > /tmp/findings/nuclei.txt
+          timeout 120 awk '{print $1}' "$TMP-live.txt" | head -20 | nuclei -silent -severity medium,high,critical -timeout 8 -c 2 -t ~/nuclei-templates/http/exposures -t ~/nuclei-templates/http/misconfiguration 2>/dev/null | head -30 > /tmp/findings/nuclei.txt || true
         else
           echo "" > /tmp/findings/nuclei.txt
         fi
@@ -259,39 +259,56 @@ jobs:
         CACHE_CHECKS=$(wc -l < /tmp/findings/deep/cache-check.txt 2>/dev/null || echo 0)
         echo "  Cache checks: $CACHE_CHECKS"
 
-        # --- CDN BYPASS ---
+        # --- CDN BYPASS (anti-parked-domain) ---
         > /tmp/findings/deep/origin-hits.txt
+        > /tmp/findings/deep/origin-bodies.txt
         head -10 "$TMP-live.txt" 2>/dev/null | awk '{print $1}' | sed 's|https://||' | while read host; do
           [ -z "$host" ] && continue
-          # Check if behind CDN
           cname=$(dig +short CNAME "$host" 2>/dev/null | head -1)
           is_cdn=0
           echo "$cname" | grep -qiE 'cloudflare|fastly|akamai|cloudfront|cdn|azureedge|azurefd|edgekey|edgesuite|akadns|awsdns|googlehosted' && is_cdn=1
 
           [ "$is_cdn" -eq 1 ] && {
-            # Try origin subdomain patterns
-            base=$(echo "$host" | sed 's/\.[^.]*\.[^.]*$//')
-            for origin_pat in "origin.$host" "direct.$host" "backend.$host" "app.$host" "prod.$host" "origin-$(echo $host | tr '.' '-')" "$(echo $host | sed 's/\.com$/.io/')"; do
+            # Try origin patterns and crt.sh IPs
+            for origin_pat in "origin.$host" "direct.$host" "backend.$host" "app.$host" "prod.$host"; do
               orig_ip=$(dig +short A "$origin_pat" 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
               [ -n "$orig_ip" ] && {
-                # Probe origin directly
-                orig_resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "Host: $host" "https://$orig_ip/" 2>/dev/null)
-                cdn_resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 "https://$host/" 2>/dev/null)
-                [ "$orig_resp" != "$cdn_resp" ] && [ "$orig_resp" != "000" ] && echo "CDN-BYPASS: $host → origin $origin_pat ($orig_ip) [$orig_resp vs CDN $cdn_resp]" >> /tmp/findings/deep/origin-hits.txt
+                orig_code=$(curl -sk -o /tmp/orig_body.txt -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "Host: $host" "https://$orig_ip/" 2>/dev/null)
+                cdn_code=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 "https://$host/" 2>/dev/null)
+                orig_size=$(wc -c < /tmp/orig_body.txt 2>/dev/null || echo 0)
+                # Only flag if response differs from CDN AND body > 100 bytes (not empty)
+                [ "$orig_code" != "$cdn_code" ] && [ "$orig_code" != "000" ] && [ "$orig_size" -gt 100 ] && {
+                  echo "$orig_ip $orig_size" >> /tmp/findings/deep/origin-bodies.txt
+                  echo "CDN-BYPASS: $host → $origin_pat ($orig_ip) [orig:$orig_code/${orig_size}b vs CDN:$cdn_code]" >> /tmp/findings/deep/origin-hits.txt
+                }
               }
             done
 
-            # Try crt.sh for historical IPs
+            # crt.sh historical IPs
             crt_ips=$(curl -s --max-time 10 "https://crt.sh/?q=%.$host&output=json" 2>/dev/null | jq -r '.[].name_value' 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u | head -5)
             for ip in $crt_ips; do
               [ "$ip" = "127.0.0.1" ] && continue
-              resp=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "Host: $host" "https://$ip/" 2>/dev/null)
-              [ "$resp" != "000" ] && [ "$resp" != "403" ] && echo "CRT-ORIGIN: $host → $ip [$resp]" >> /tmp/findings/deep/origin-hits.txt
+              resp=$(curl -sk -o /tmp/crt_body.txt -w "%{http_code}" --connect-timeout 3 --max-time 5 -H "Host: $host" "https://$ip/" 2>/dev/null)
+              crt_size=$(wc -c < /tmp/crt_body.txt 2>/dev/null || echo 0)
+              [ "$resp" != "000" ] && [ "$resp" != "403" ] && [ "$crt_size" -gt 100 ] && {
+                echo "$ip $crt_size" >> /tmp/findings/deep/origin-bodies.txt
+                echo "CRT-ORIGIN: $host → $ip [$resp/${crt_size}b]" >> /tmp/findings/deep/origin-hits.txt
+              }
             done
           }
         done
-        ORIGIN_HITS=$(wc -l < /tmp/findings/deep/origin-hits.txt 2>/dev/null || echo 0)
-        echo "  Origin bypass: $ORIGIN_HITS hits"
+
+        # Filter parked domains: if 3+ hosts on same IP have identical body size → parked
+        > /tmp/findings/deep/real-origins.txt
+        while read line; do
+          ip=$(echo "$line" | awk '{print $1}')
+          size=$(echo "$line" | awk '{print $2}')
+          same_count=$(grep -c "^$ip " /tmp/findings/deep/origin-bodies.txt 2>/dev/null)
+          [ "$same_count" -lt 3 ] && grep "$ip" /tmp/findings/deep/origin-hits.txt 2>/dev/null >> /tmp/findings/deep/real-origins.txt
+        done < /tmp/findings/deep/origin-bodies.txt
+        sort -u /tmp/findings/deep/real-origins.txt -o /tmp/findings/deep/real-origins.txt 2>/dev/null
+        ORIGIN_HITS=$(wc -l < /tmp/findings/deep/real-origins.txt 2>/dev/null || echo 0)
+        echo "  Origin bypass: $ORIGIN_HITS (filtered)"
 
         # Export deep results for report
         echo "ssrf_deep=$SSRF_DEEP" >> $GITHUB_OUTPUT
@@ -416,5 +433,6 @@ jobs:
       run: |
         git config user.name "SUPER-ARSENAL"
         git config user.email "hunter@arsenal.bot"
+        git pull --rebase origin main 2>/dev/null || true
         git add reports/
-        git diff --staged --quiet || git commit -m "hunt: $(ls reports/*.md 2>/dev/null | tail -1 | xargs basename)" && git push
+        git diff --staged --quiet || git commit -m "hunt: $(ls reports/*.md 2>/dev/null | tail -1 | xargs basename)" && git push || git push
