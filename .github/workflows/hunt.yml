@@ -60,6 +60,7 @@ jobs:
 
     - name: Recon
       run: |
+        set +e
         export PATH=$HOME/go/bin:$PATH
 
         DOMAIN="${DOMAIN:-}"
@@ -112,6 +113,7 @@ jobs:
     - name: Detect
       id: detect
       run: |
+        set +e
         export PATH=$HOME/go/bin:$PATH
         DOMAIN="${DOMAIN:-${{ inputs.domain }}}"
         [ -z "$DOMAIN" ] && DOMAIN="unknown"
@@ -154,6 +156,7 @@ jobs:
 
     - name: Report
       run: |
+        set +e
         DOMAIN="${DOMAIN:-${{ inputs.domain }}}"
         PROGRAM="${PROGRAM:-${{ inputs.program }}}"
         [ -z "$DOMAIN" ] && DOMAIN="unknown"
