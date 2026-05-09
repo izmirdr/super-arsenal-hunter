@@ -145,11 +145,11 @@ jobs:
         grep -E '/api/|/graphql|/v[0-9]+/|/rest/' "$TMP-urls.txt" 2>/dev/null | head -30 > /tmp/findings/api.txt
         API=$(grep -c http /tmp/findings/api.txt 2>/dev/null); echo "api=${API:-0}" >> $GITHUB_OUTPUT
 
-        # JS secrets (jsluice)
+        # JS secrets (jsluice) - with timeout to prevent hangs
         > /tmp/findings/secrets.txt
-        grep -E '\.js(\?|$)' "$TMP-urls.txt" 2>/dev/null | head -15 | while read url; do
-          curl -s --connect-timeout 5 --max-time 8 "$url" 2>/dev/null
-        done | jsluice secrets 2>/dev/null | head -30 > /tmp/findings/secrets.txt
+        grep -E '\.js(\?|$)' "$TMP-urls.txt" 2>/dev/null | head -10 | while read url; do
+          timeout 8 curl -s --connect-timeout 4 --max-time 6 "$url" 2>/dev/null || true
+        done 2>/dev/null | timeout 30 jsluice secrets 2>/dev/null | head -30 > /tmp/findings/secrets.txt || true
         SECRETS=$(grep -c . /tmp/findings/secrets.txt 2>/dev/null); echo "secrets=${SECRETS:-0}" >> $GITHUB_OUTPUT
 
         # SSRF
