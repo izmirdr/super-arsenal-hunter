@@ -120,22 +120,22 @@ jobs:
 
         # IDOR
         grep -E '(^|\?|&)(id|user_id|uid|account_id|order_id|profile_id|doc_id|file_id|report_id|ticket_id|number|num)\s*[=:/]\s*[0-9]{1,10}' "$TMP-urls.txt" 2>/dev/null | head -30 > /tmp/findings/idor.txt
-        echo "idor=$(grep -c http /tmp/findings/idor.txt 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        IDOR=$(grep -c http /tmp/findings/idor.txt 2>/dev/null); echo "idor=${IDOR:-0}" >> $GITHUB_OUTPUT
 
         # API
         grep -E '/api/|/graphql|/v[0-9]+/|/rest/' "$TMP-urls.txt" 2>/dev/null | head -30 > /tmp/findings/api.txt
-        echo "api=$(grep -c http /tmp/findings/api.txt 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        API=$(grep -c http /tmp/findings/api.txt 2>/dev/null); echo "api=${API:-0}" >> $GITHUB_OUTPUT
 
         # JS secrets (jsluice)
         > /tmp/findings/secrets.txt
         grep -E '\.js(\?|$)' "$TMP-urls.txt" 2>/dev/null | head -15 | while read url; do
           curl -s --connect-timeout 5 --max-time 8 "$url" 2>/dev/null
         done | jsluice secrets 2>/dev/null | head -30 > /tmp/findings/secrets.txt
-        echo "secrets=$(grep -c . /tmp/findings/secrets.txt 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        SECRETS=$(grep -c . /tmp/findings/secrets.txt 2>/dev/null); echo "secrets=${SECRETS:-0}" >> $GITHUB_OUTPUT
 
         # SSRF
         grep -E '(url|uri|redirect|callback|webhook|proxy|fetch)=' "$TMP-urls.txt" 2>/dev/null | head -20 > /tmp/findings/ssrf.txt
-        echo "ssrf=$(grep -c http /tmp/findings/ssrf.txt 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        SSRF=$(grep -c http /tmp/findings/ssrf.txt 2>/dev/null); echo "ssrf=${SSRF:-0}" >> $GITHUB_OUTPUT
 
         # Nuclei
         if [ -s "$TMP-live.txt" ] && [ "$(wc -l < "$TMP-live.txt")" -lt 30 ]; then
